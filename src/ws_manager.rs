@@ -13,6 +13,8 @@ pub struct WsClient {
     write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     active_subscriptions: Arc<RwLock<HashSet<String>>>,
     channels: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
+    response_channels: Arc<RwLock<HashMap<u64, mpsc::Sender<Value>>>>,
+    request_id: Arc<RwLock<u64>>,
 }
 
 impl WsClient {
@@ -29,21 +31,26 @@ impl WsClient {
     pub async fn new(endpoint: &str) -> Result<Self> {
         let url = Url::parse(endpoint).context("Invalid WebSocket URL")?;
         let (ws_stream, _) = connect_async(url).await.context("Failed to connect to WebSocket")?;
-        println!("WebSocket connected to {}", endpoint);  //Loggin message
+        println!("WebSocket connected to {}", endpoint);
         let (write, read) = ws_stream.split();
 
         let active_subscriptions = Arc::new(RwLock::new(HashSet::new()));
         let channels = Arc::new(RwLock::new(HashMap::new()));
+        let response_channels = Arc::new(RwLock::new(HashMap::new()));
+        let request_id = Arc::new(RwLock::new(0));
 
-        let channels_clone = channels.clone();
+        let response_channels_clone = response_channels.clone();
+        let channels_clone = channels.clone(); // Здесь клонируем Arc
         tokio::spawn(async move {
-            Self::listen_loop(read, channels_clone).await;
+            Self::listen_loop(read, channels_clone, response_channels_clone).await;
         });
 
         Ok(Self {
             write,
             active_subscriptions,
             channels,
+            response_channels,
+            request_id,
         })
     }
 
@@ -58,20 +65,27 @@ impl WsClient {
     async fn listen_loop(
         mut read_stream: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
         channels: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
+        response_channels: Arc<RwLock<HashMap<u64, mpsc::Sender<Value>>>>,
     ) {
         while let Some(msg) = read_stream.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    //println!("Received message: {}", text);
                     let parsed: Value = serde_json::from_str(&text).unwrap_or(json!({}));
-                    if let Some(msg_type) = parsed["channel"].as_str() 
-                    {
-                        //println!("Message type: {}", msg_type);
-                        let channels_read = channels.read().await;
-                        if let Some(sender) = channels_read.get(msg_type) {
-                            let _ = sender.send(text).await;
+                    if let Some(msg_type) = parsed["channel"].as_str() {
+                        if msg_type == "post" {
+                            if let Some(response) = parsed["data"].as_object() {
+                                if let Some(id) = response["id"].as_u64() {
+                                    let mut resp_ch = response_channels.write().await;
+                                    if let Some(sender) = resp_ch.remove(&id) {
+                                        let _ = sender.send(response["response"].clone()).await;
+                                    }
+                                }
+                            }
                         } else {
-                            eprintln!("Unknown message type: {}", msg_type);
+                            let channels_read = channels.read().await;
+                            if let Some(sender) = channels_read.get(msg_type) {
+                                let _ = sender.send(text).await;
+                            }
                         }
                     }
                 }
@@ -108,6 +122,28 @@ impl WsClient {
         channels.insert(msg_type.clone(), tx);
 
         Ok(rx)
+    }
+
+    pub async fn post_request(&mut self, request_type: &str, payload: Value) -> Result<Value> {
+        let mut id_guard = self.request_id.write().await;
+        let request_id = *id_guard;
+        *id_guard += 1;
+        drop(id_guard);
+        
+        let msg = json!({
+            "method": "post",
+            "id": request_id,
+            "request": {
+                "type": request_type,
+                "payload": payload
+            }
+        });
+
+        let (tx, mut rx) = mpsc::channel(1);
+        self.response_channels.write().await.insert(request_id, tx);
+
+        self.write.send(Message::Text(msg.to_string())).await.context("Failed to send post request")?;
+        rx.recv().await.context("No response received")
     }
 
     /// Unsubscribes from a specific WebSocket feed and removes the associated channel.
