@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tokio = {version = "1.29.1", features = ["full"]}
+tokio-tungstenite = {version = "0.20.0", features = ["native-tls"]}
+futures-util = "0.3.28"
+serde = {version = "1.0.175", features = ["derive"]}
+serde_json = "1.0.103"
+url = "2.5"
+anyhow = "1.0"
